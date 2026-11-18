@@ -575,7 +575,8 @@ export const methods = {
       throw new Error("kernel must be a matrix");
     }
 
-    const newData = Buffer.from(image.bitmap.data);
+    const { width, height } = image.bitmap;
+    const data = image.bitmap.data;
     const kRows = kernel.length;
     const kCols = kernel[0].length;
     const rowEnd = Math.floor(kRows / 2);
@@ -583,73 +584,168 @@ export const methods = {
     const rowIni = -rowEnd;
     const colIni = -colEnd;
 
-    let weight;
-    let rSum;
-    let gSum;
-    let bSum;
-    let ri;
-    let gi;
-    let bi;
-    let xi;
-    let yi;
-    let idxi;
+    // Fast path: a 3x3 kernel made of integer weights with the default
+    // edge handling. All arithmetic stays integer and no per-pixel helper
+    // calls or closures are involved, while every output byte matches the
+    // generic implementation exactly (alpha is left untouched).
+    if (
+      edgeHandling === Edge.EXTEND &&
+      kRows === 3 &&
+      kCols === 3 &&
+      kernel.every((kernelRow) =>
+        kernelRow.every((weight) => Number.isInteger(weight)),
+      )
+    ) {
+      const k00 = kernel[0]![0]!;
+      const k01 = kernel[0]![1]!;
+      const k02 = kernel[0]![2]!;
+      const k10 = kernel[1]![0]!;
+      const k11 = kernel[1]![1]!;
+      const k12 = kernel[1]![2]!;
+      const k20 = kernel[2]![0]!;
+      const k21 = kernel[2]![1]!;
+      const k22 = kernel[2]![2]!;
 
-    image.scan((x, y, idx) => {
-      bSum = 0;
-      gSum = 0;
-      rSum = 0;
+      const newData = Buffer.from(data);
 
-      for (let row = rowIni; row <= rowEnd; row++) {
-        for (let col = colIni; col <= colEnd; col++) {
-          xi = x + col;
-          yi = y + row;
-          weight = kernel[row + rowEnd]![col + colEnd]!;
-          idxi = image.getPixelIndex(xi, yi, edgeHandling);
+      for (let y = 0; y < height; y++) {
+        const yMinus = y > 0 ? y - 1 : 0;
+        const yPlus = y < height - 1 ? y + 1 : height - 1;
+        const rowOff = y * width;
+        const rowMinusOff = yMinus * width;
+        const rowPlusOff = yPlus * width;
 
-          if (idxi === -1) {
-            bi = 0;
-            gi = 0;
-            ri = 0;
-          } else {
-            ri = image.bitmap.data[idxi + 0]!;
-            gi = image.bitmap.data[idxi + 1]!;
-            bi = image.bitmap.data[idxi + 2]!;
-          }
+        for (let x = 0; x < width; x++) {
+          const xMinus = x > 0 ? x - 1 : 0;
+          const xPlus = x < width - 1 ? x + 1 : width - 1;
 
-          rSum += weight * ri;
-          gSum += weight * gi;
-          bSum += weight * bi;
+          // Byte offsets of the 3x3 neighborhood; computed once and
+          // reused for every channel.
+          const i00 = (rowMinusOff + xMinus) << 2;
+          const i01 = (rowMinusOff + x) << 2;
+          const i02 = (rowMinusOff + xPlus) << 2;
+          const i10 = (rowOff + xMinus) << 2;
+          const i11 = (rowOff + x) << 2;
+          const i12 = (rowOff + xPlus) << 2;
+          const i20 = (rowPlusOff + xMinus) << 2;
+          const i21 = (rowPlusOff + x) << 2;
+          const i22 = (rowPlusOff + xPlus) << 2;
+
+          const rSum =
+            k00 * data[i00]! +
+            k01 * data[i01]! +
+            k02 * data[i02]! +
+            k10 * data[i10]! +
+            k11 * data[i11]! +
+            k12 * data[i12]! +
+            k20 * data[i20]! +
+            k21 * data[i21]! +
+            k22 * data[i22]!;
+
+          const gSum =
+            k00 * data[i00 + 1]! +
+            k01 * data[i01 + 1]! +
+            k02 * data[i02 + 1]! +
+            k10 * data[i10 + 1]! +
+            k11 * data[i11 + 1]! +
+            k12 * data[i12 + 1]! +
+            k20 * data[i20 + 1]! +
+            k21 * data[i21 + 1]! +
+            k22 * data[i22 + 1]!;
+
+          const bSum =
+            k00 * data[i00 + 2]! +
+            k01 * data[i01 + 2]! +
+            k02 * data[i02 + 2]! +
+            k10 * data[i10 + 2]! +
+            k11 * data[i11 + 2]! +
+            k12 * data[i12 + 2]! +
+            k20 * data[i20 + 2]! +
+            k21 * data[i21 + 2]! +
+            k22 * data[i22 + 2]!;
+
+          newData[i11] = rSum < 0 ? 0 : rSum > 255 ? 255 : rSum;
+          newData[i11 + 1] = gSum < 0 ? 0 : gSum > 255 ? 255 : gSum;
+          newData[i11 + 2] = bSum < 0 ? 0 : bSum > 255 ? 255 : bSum;
         }
       }
 
-      if (rSum < 0) {
-        rSum = 0;
-      }
+      image.bitmap.data = newData;
 
-      if (gSum < 0) {
-        gSum = 0;
-      }
+      return image;
+    }
 
-      if (bSum < 0) {
+    const newData = Buffer.from(data);
+    let weight: number;
+    let rSum: number;
+    let gSum: number;
+    let bSum: number;
+    let ri: number;
+    let gi: number;
+    let bi: number;
+    let xi: number;
+    let yi: number;
+    let idxi: number;
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
         bSum = 0;
-      }
+        gSum = 0;
+        rSum = 0;
 
-      if (rSum > 255) {
-        rSum = 255;
-      }
+        for (let row = rowIni; row <= rowEnd; row++) {
+          for (let col = colIni; col <= colEnd; col++) {
+            xi = x + col;
+            yi = y + row;
+            weight = kernel[row + rowEnd]![col + colEnd]!;
+            idxi = image.getPixelIndex(xi, yi, edgeHandling);
 
-      if (gSum > 255) {
-        gSum = 255;
-      }
+            if (idxi === -1) {
+              bi = 0;
+              gi = 0;
+              ri = 0;
+            } else {
+              ri = data[idxi + 0]!;
+              gi = data[idxi + 1]!;
+              bi = data[idxi + 2]!;
+            }
 
-      if (bSum > 255) {
-        bSum = 255;
-      }
+            rSum += weight * ri;
+            gSum += weight * gi;
+            bSum += weight * bi;
+          }
+        }
 
-      newData[idx + 0] = rSum;
-      newData[idx + 1] = gSum;
-      newData[idx + 2] = bSum;
-    });
+        if (rSum < 0) {
+          rSum = 0;
+        }
+
+        if (gSum < 0) {
+          gSum = 0;
+        }
+
+        if (bSum < 0) {
+          bSum = 0;
+        }
+
+        if (rSum > 255) {
+          rSum = 255;
+        }
+
+        if (gSum > 255) {
+          gSum = 255;
+        }
+
+        if (bSum > 255) {
+          bSum = 255;
+        }
+
+        const idx = (y * width + x) << 2;
+        newData[idx + 0] = rSum;
+        newData[idx + 1] = gSum;
+        newData[idx + 2] = bSum;
+      }
+    }
 
     image.bitmap.data = newData;
 
@@ -761,15 +857,49 @@ export const methods = {
       : ({ kernel: parsed } as ConvoluteComplexOptions);
 
     const source = clone(image);
+    const srcData = source.bitmap.data;
+    const { width, height } = source.bitmap;
+    const size = (kernel.length - 1) / 2;
+    const data = image.bitmap.data;
 
-    scan(source, x, y, w, h, (xx, yx, idx) => {
-      const value = applyKernel(source, kernel, xx, yx);
+    // scan() rounds the region parameters before iterating; keep the
+    // same contract for the direct loop below.
+    const rx = Math.round(x);
+    const ry = Math.round(y);
+    const rw = Math.round(w);
+    const rh = Math.round(h);
 
-      image.bitmap.data[idx] = limit255(value[0]!);
-      image.bitmap.data[idx + 1] = limit255(value[1]!);
-      image.bitmap.data[idx + 2] = limit255(value[2]!);
-      image.bitmap.data[idx + 3] = limit255(value[3]!);
-    });
+    for (let yy = ry; yy < ry + rh; yy++) {
+      for (let xx = rx; xx < rx + rw; xx++) {
+        let rSum = 0;
+        let gSum = 0;
+        let bSum = 0;
+        let aSum = 0;
+
+        for (let kx = 0; kx < kernel.length; kx += 1) {
+          // applyKernel() clamps sample coordinates to the bitmap edges,
+          // matching the default EXTEND edge handling of getPixelIndex().
+          const sampleY = Math.min(height - 1, Math.max(0, yy + kx - size));
+
+          for (let ky = 0; ky < kernel[kx]!.length; ky += 1) {
+            const sampleX = Math.min(width - 1, Math.max(0, xx + ky - size));
+            const weight = kernel[kx]![ky]!;
+            const idx = (sampleY * width + sampleX) << 2;
+
+            rSum += srcData[idx]! * weight;
+            gSum += srcData[idx + 1]! * weight;
+            bSum += srcData[idx + 2]! * weight;
+            aSum += srcData[idx + 3]! * weight;
+          }
+        }
+
+        const idx = (yy * width + xx) << 2;
+        data[idx] = limit255(rSum);
+        data[idx + 1] = limit255(gSum);
+        data[idx + 2] = limit255(bSum);
+        data[idx + 3] = limit255(aSum);
+      }
+    }
 
     return image;
   },

@@ -1,6 +1,5 @@
 import { mulTable, shgTable } from "./blur-tables.js";
 import { JimpClass } from "@jimp/types";
-import { limit255 } from "@jimp/utils";
 
 /*
     Superfast Blur (0.5)
@@ -56,8 +55,6 @@ export const methods = {
     let gsum: number;
     let bsum: number;
     let asum: number;
-    let x: number;
-    let y: number;
     let i: number;
     let p: number;
     let p1: number;
@@ -66,21 +63,49 @@ export const methods = {
     let yi: number;
     let yw: number;
 
-    const wm = image.bitmap.width - 1;
-    const hm = image.bitmap.height - 1;
-    // const wh = image.bitmap.width * image.bitmap.height;
+    const { width, height } = image.bitmap;
+    const data = image.bitmap.data;
+    const wm = width - 1;
+    const hm = height - 1;
+    const rowBytes = width << 2;
     const rad1 = r + 1;
 
     const mulSum = mulTable[r]!;
     const shgSum = shgTable[r]!;
 
-    const red = [];
-    const green = [];
-    const blue = [];
-    const alpha = [];
+    // Byte offsets of the pixel that enters / leaves the horizontal
+    // sliding window at each x position (independent of y).
+    const hIn = new Int32Array(width);
+    const hOut = new Int32Array(width);
 
-    const vmin = [];
-    const vmax = [];
+    for (let x = 0; x < width; x++) {
+      p = x + rad1;
+      hIn[x] = (p < wm ? p : wm) << 2;
+      p = x - r;
+      hOut[x] = (p > 0 ? p : 0) << 2;
+    }
+
+    // Pixel offsets (row index * width, x is added later) of the row
+    // that enters / leaves the vertical sliding window at each y.
+    const vIn = new Int32Array(height);
+    const vOut = new Int32Array(height);
+
+    for (let y = 0; y < height; y++) {
+      p = y + rad1;
+      vIn[y] = (p < hm ? p : hm) * width;
+      p = y - r;
+      vOut[y] = (p > 0 ? p : 0) * width;
+    }
+
+    const red = new Int32Array(width * height);
+    const green = new Int32Array(width * height);
+    const blue = new Int32Array(width * height);
+    const alpha = new Int32Array(width * height);
+
+    // Working copy of the RGBA bytes. Assigning an out-of-range integer
+    // clamps it to 0..255 exactly like limit255() did, but in the typed
+    // array setter instead of a function call with Math.max / Math.min.
+    const work = new Uint8ClampedArray(data);
 
     let iterations = 2;
 
@@ -88,46 +113,41 @@ export const methods = {
       yi = 0;
       yw = 0;
 
-      for (y = 0; y < image.bitmap.height; y++) {
-        rsum = image.bitmap.data[yw]! * rad1;
-        gsum = image.bitmap.data[yw + 1]! * rad1;
-        bsum = image.bitmap.data[yw + 2]! * rad1;
-        asum = image.bitmap.data[yw + 3]! * rad1;
+      for (let y = 0; y < height; y++) {
+        rsum = work[yw]! * rad1;
+        gsum = work[yw + 1]! * rad1;
+        bsum = work[yw + 2]! * rad1;
+        asum = work[yw + 3]! * rad1;
 
         for (i = 1; i <= r; i++) {
           p = yw + ((i > wm ? wm : i) << 2);
-          rsum += image.bitmap.data[p++]!;
-          gsum += image.bitmap.data[p++]!;
-          bsum += image.bitmap.data[p++]!;
-          asum += image.bitmap.data[p]!;
+          rsum += work[p]!;
+          gsum += work[p + 1]!;
+          bsum += work[p + 2]!;
+          asum += work[p + 3]!;
         }
 
-        for (x = 0; x < image.bitmap.width; x++) {
+        for (let x = 0; x < width; x++) {
           red[yi] = rsum;
           green[yi] = gsum;
           blue[yi] = bsum;
           alpha[yi] = asum;
 
-          if (y === 0) {
-            vmin[x] = ((p = x + rad1) < wm ? p : wm) << 2;
-            vmax[x] = (p = x - r) > 0 ? p << 2 : 0;
-          }
+          p1 = yw + hIn[x]!;
+          p2 = yw + hOut[x]!;
 
-          p1 = yw + vmin[x]!;
-          p2 = yw + vmax[x]!;
-
-          rsum += image.bitmap.data[p1++]! - image.bitmap.data[p2++]!;
-          gsum += image.bitmap.data[p1++]! - image.bitmap.data[p2++]!;
-          bsum += image.bitmap.data[p1++]! - image.bitmap.data[p2++]!;
-          asum += image.bitmap.data[p1]! - image.bitmap.data[p2++]!;
+          rsum += work[p1]! - work[p2]!;
+          gsum += work[p1 + 1]! - work[p2 + 1]!;
+          bsum += work[p1 + 2]! - work[p2 + 2]!;
+          asum += work[p1 + 3]! - work[p2 + 3]!;
 
           yi++;
         }
 
-        yw += image.bitmap.width << 2;
+        yw += rowBytes;
       }
 
-      for (x = 0; x < image.bitmap.width; x++) {
+      for (let x = 0; x < width; x++) {
         yp = x;
         rsum = red[yp]! * rad1;
         gsum = green[yp]! * rad1;
@@ -135,7 +155,7 @@ export const methods = {
         asum = alpha[yp]! * rad1;
 
         for (i = 1; i <= r; i++) {
-          yp += i > hm ? 0 : image.bitmap.width;
+          yp += i > hm ? 0 : width;
           rsum += red[yp]!;
           gsum += green[yp]!;
           bsum += blue[yp]!;
@@ -144,29 +164,30 @@ export const methods = {
 
         yi = x << 2;
 
-        for (y = 0; y < image.bitmap.height; y++) {
-          image.bitmap.data[yi] = limit255((rsum * mulSum) >>> shgSum);
-          image.bitmap.data[yi + 1] = limit255((gsum * mulSum) >>> shgSum);
-          image.bitmap.data[yi + 2] = limit255((bsum * mulSum) >>> shgSum);
-          image.bitmap.data[yi + 3] = limit255((asum * mulSum) >>> shgSum);
+        for (let y = 0; y < height; y++) {
+          // (x >>> shg) is always a non-negative integer, so the typed
+          // array setter's built-in clamp matches limit255() byte for byte.
+          work[yi] = (rsum * mulSum) >>> shgSum;
+          work[yi + 1] = (gsum * mulSum) >>> shgSum;
+          work[yi + 2] = (bsum * mulSum) >>> shgSum;
+          work[yi + 3] = (asum * mulSum) >>> shgSum;
 
-          if (x === 0) {
-            vmin[y] = ((p = y + rad1) < hm ? p : hm) * image.bitmap.width;
-            vmax[y] = (p = y - r) > 0 ? p * image.bitmap.width : 0;
-          }
-
-          p1 = x + vmin[y]!;
-          p2 = x + vmax[y]!;
+          p1 = x + vIn[y]!;
+          p2 = x + vOut[y]!;
 
           rsum += red[p1]! - red[p2]!;
           gsum += green[p1]! - green[p2]!;
           bsum += blue[p1]! - blue[p2]!;
           asum += alpha[p1]! - alpha[p2]!;
 
-          yi += image.bitmap.width << 2;
+          yi += rowBytes;
         }
       }
     }
+
+    // Write the clamped results back into the original bitmap buffer,
+    // preserving the reference held by the image.
+    data.set(work);
 
     return image;
   },

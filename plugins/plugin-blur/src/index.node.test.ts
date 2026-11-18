@@ -14,4 +14,10 @@ describe("hasAlpha", () => {
     const output = await image.blur(16).getBuffer("image/png");
     expect(output).toMatchImageSnapshot();
   });
+
+  test("radius 3 blur keeps the soft-edge output byte stable", async () => {
+    const image = await Jimp.read(getTestImagePath("dice.png"));
+    const output = await image.blur(3).getBuffer("image/png");
+    expect(output).toMatchImageSnapshot();
+  });
 });
